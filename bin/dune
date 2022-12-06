@@ -2,4 +2,5 @@
  (public_name olly)
  (name olly)
  (modules olly)
- (libraries runtime_events unix hdr_histogram cmdliner))
+ (preprocess (pps ppx_yojson_conv))
+ (libraries runtime_events unix hdr_histogram cmdliner yojson))

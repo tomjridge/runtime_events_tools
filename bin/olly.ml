@@ -2,6 +2,15 @@ module H = Hdr_histogram
 module Ts = Runtime_events.Timestamp
 open Cmdliner
 
+type event = {
+  name:string;
+  cat:string;
+  ph:string;
+  ts:int64;
+  pid:int;
+  tid:int
+}[@@deriving yojson]
+
 let print_percentiles json output hist =
   let ms ns = ns /. 1000000. in
   let mean_latency = H.mean hist |> ms
@@ -110,6 +119,7 @@ let trace trace_filename exec_args =
   let trace_file = open_out trace_filename in
   let ts_to_us ts = Int64.(div (Ts.to_int64 ts) (of_int 1000)) in
   let runtime_begin ring_id ts phase =
+    (* we don't use yojson because of the potential overhead compared to plain fprintf *)
     Printf.fprintf trace_file
       "{\"name\": \"%s\", \"cat\": \"PERF\", \"ph\":\"B\", \"ts\":%Ld, \
        \"pid\": %d, \"tid\": %d},\n"
@@ -133,6 +143,7 @@ let trace trace_filename exec_args =
   olly ~runtime_begin ~runtime_end ~init ~cleanup exec_args
 
 let latency json output exec_args =
+  let count = ref 0 in
   let current_event = Hashtbl.create 13 in
   let hist =
     H.init ~lowest_discernible_value:10 ~highest_trackable_value:10_000_000_000
@@ -148,12 +159,107 @@ let latency json output exec_args =
     | Some (saved_phase, saved_ts) when saved_phase = phase ->
         Hashtbl.remove current_event ring_id;
         let latency = Int64.to_int (Int64.sub (Ts.to_int64 ts) saved_ts) in
+        incr count;
         assert (H.record_value hist latency)
     | _ -> ()
   in
   let init = Fun.id in
-  let cleanup () = print_percentiles json output hist in
+  let cleanup () = print_percentiles json output hist; Printf.printf "Total count of events: %d\n" !count in
   olly ~runtime_begin ~runtime_end ~init ~cleanup exec_args
+
+(* FIXME move to Runtime_event module; make efficient *) 
+let string_to_runtime_phase = 
+  let tbl = Hashtbl.create 13 in
+  let all_phases = Runtime_events.[
+      EV_EXPLICIT_GC_SET
+    ; EV_EXPLICIT_GC_STAT
+    ; EV_EXPLICIT_GC_MINOR
+    ; EV_EXPLICIT_GC_MAJOR
+    ; EV_EXPLICIT_GC_FULL_MAJOR
+    ; EV_EXPLICIT_GC_COMPACT
+    ; EV_MAJOR
+    ; EV_MAJOR_SWEEP
+    ; EV_MAJOR_MARK_ROOTS
+    ; EV_MAJOR_MARK
+    ; EV_MINOR
+    ; EV_MINOR_LOCAL_ROOTS
+    ; EV_MINOR_FINALIZED
+    ; EV_EXPLICIT_GC_MAJOR_SLICE
+    ; EV_FINALISE_UPDATE_FIRST
+    ; EV_FINALISE_UPDATE_LAST
+    ; EV_INTERRUPT_REMOTE
+    ; EV_MAJOR_EPHE_MARK
+    ; EV_MAJOR_EPHE_SWEEP
+    ; EV_MAJOR_FINISH_MARKING
+    ; EV_MAJOR_GC_CYCLE_DOMAINS
+    ; EV_MAJOR_GC_PHASE_CHANGE
+    ; EV_MAJOR_GC_STW
+    ; EV_MAJOR_MARK_OPPORTUNISTIC
+    ; EV_MAJOR_SLICE
+    ; EV_MAJOR_FINISH_CYCLE
+    ; EV_MINOR_CLEAR
+    ; EV_MINOR_FINALIZERS_OLDIFY
+    ; EV_MINOR_GLOBAL_ROOTS
+    ; EV_MINOR_LEAVE_BARRIER
+    ; EV_STW_API_BARRIER
+    ; EV_STW_HANDLER
+    ; EV_STW_LEADER
+    ; EV_MAJOR_FINISH_SWEEPING
+    ; EV_MINOR_FINALIZERS_ADMIN
+    ; EV_MINOR_REMEMBERED_SET
+    ; EV_MINOR_REMEMBERED_SET_PROMOTE
+    ; EV_MINOR_LOCAL_ROOTS_PROMOTE
+    ; EV_DOMAIN_CONDITION_WAIT
+    ; EV_DOMAIN_RESIZE_HEAP_RESERVATION] 
+    (* NOTE the above should be all the variants for the type *)
+  in
+  all_phases |> List.iter (fun ph -> Hashtbl.replace tbl (Runtime_events.runtime_phase_name ph) ph);
+  fun s -> Hashtbl.find tbl s
+
+let trace_to_latency (json:bool) (output:string option) trace_filename = 
+  let trace_file = open_in trace_filename in
+  (* quick and dirty - we really need a stream of events *)
+  let seq = 
+    trace_file |> Yojson.Safe.from_channel |> function 
+    | `List xs -> List.to_seq xs
+    | _ -> failwith ""
+  in
+
+  (* cut-n-paste from latency above *)
+  let current_event = Hashtbl.create 13 in
+  let hist =
+    H.init ~lowest_discernible_value:10 ~highest_trackable_value:10_000_000_000
+      ~significant_figures:3
+  in
+  let runtime_begin ring_id (ts:int64) (phase:Runtime_events.runtime_phase) =
+    match Hashtbl.find_opt current_event ring_id with
+    | None -> Hashtbl.add current_event ring_id (phase, ts)
+    | _ -> ()
+  in
+  let runtime_end ring_id ts (phase:Runtime_events.runtime_phase) =
+    match Hashtbl.find_opt current_event ring_id with
+    | Some (saved_phase, saved_ts) when saved_phase = phase ->
+        Hashtbl.remove current_event ring_id;
+        let latency = Int64.to_int (Int64.sub ts saved_ts) in
+        Printf.printf "recording E %d\n" latency;
+        assert (H.record_value hist latency)
+    | _ -> ()
+  in
+  seq |> Seq.iter (fun json -> 
+      let evt = event_of_yojson json in
+      match evt.ph with
+      | "B" -> runtime_begin evt.pid evt.ts (string_to_runtime_phase evt.name)
+      | "E" -> runtime_end evt.pid evt.ts (string_to_runtime_phase evt.name)
+      | _ -> failwith "unknown phase");
+  print_percentiles json output hist  
+
+let run_test () =
+  let hist =
+    H.init ~lowest_discernible_value:10 ~highest_trackable_value:10_000_000_000
+      ~significant_figures:3
+  in
+  [77;3;824;22] |> List.iter (fun lat -> assert(H.record_value hist (lat * 1000)));
+  print_percentiles false None hist  
 
 let help man_format cmds topic =
   match topic with
@@ -219,7 +325,7 @@ let () =
 
   let json_option =
     let doc = "Print the output in json instead of human-readable format." in
-    Arg.(value & flag & info [ "json" ] ~docv:"json" ~doc)
+    Arg.(value & flag & info [ "json" ] ~docv:"json" (* FIXME needed? *) ~doc) 
   in
 
   let output_option =
@@ -246,6 +352,30 @@ let () =
     Cmd.v info Term.(const latency $ json_option $ output_option $ exec_args 0)
   in
 
+  let trace_file_arg = 
+    let doc = "The trace file in json format." in
+    Arg.(required & pos 0 (some string) None & info [] ~docv:"TRACE_FILE" ~doc)
+  in
+
+  let trace_to_latency_cmd = 
+    let doc = "Read trace and report the GC latency profile." in
+    let man =
+      [
+        `S Manpage.s_description;
+        `P doc;
+        `Blocks help_secs;
+      ]
+    in
+    let info = Cmd.info "trace_to_latency" ~doc ~sdocs ~man in
+    Cmd.v info Term.(const trace_to_latency $ json_option $ output_option $ trace_file_arg)
+  in    
+
+  let run_test_cmd = 
+    let info = Cmd.info "run_test" in
+    Cmd.v info Term.(const run_test $ const ())
+  in
+    
+
   let help_cmd =
     let topic =
       let doc = "The topic to get help on. $(b,topics) lists the topics." in
@@ -267,7 +397,7 @@ let () =
   let main_cmd =
     let doc = "An observability tool for OCaml programs" in
     let info = Cmd.info "olly" ~doc ~sdocs in
-    Cmd.group info [ trace_cmd; latency_cmd; help_cmd ]
+    Cmd.group info [ trace_cmd; latency_cmd; trace_to_latency_cmd; run_test_cmd; help_cmd ]
   in
 
   exit (Cmd.eval main_cmd)
