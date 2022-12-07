@@ -12,6 +12,8 @@ type event = {
 }[@@deriving yojson]
 
 let print_percentiles json output hist =
+  (* Note the latencies are printed in ms; timestamps are in nanoseconds; traces are
+     written as us *)
   let ms ns = ns /. 1000000. in
   let mean_latency = H.mean hist |> ms
   and max_latency = float_of_int (H.max hist) |> ms in
@@ -117,6 +119,7 @@ let olly ~runtime_begin ~runtime_end ~cleanup ~init exec_args =
 
 let trace trace_filename exec_args =
   let trace_file = open_out trace_filename in
+  (* Note trace timestamps in us, since this is expected by Chrome tracing? *)
   let ts_to_us ts = Int64.(div (Ts.to_int64 ts) (of_int 1000)) in
   let runtime_begin ring_id ts phase =
     (* we don't use yojson because of the potential overhead compared to plain fprintf *)
@@ -160,6 +163,7 @@ let latency json output exec_args =
         Hashtbl.remove current_event ring_id;
         let latency = Int64.to_int (Int64.sub (Ts.to_int64 ts) saved_ts) in
         incr count;
+        (* Note this is recording the latency in ns *)
         assert (H.record_value hist latency)
     | _ -> ()
   in
@@ -239,10 +243,11 @@ let trace_to_latency (json:bool) (output:string option) trace_filename =
   let runtime_end ring_id ts (phase:Runtime_events.runtime_phase) =
     match Hashtbl.find_opt current_event ring_id with
     | Some (saved_phase, saved_ts) when saved_phase = phase ->
-        Hashtbl.remove current_event ring_id;
+        Hashtbl.remove current_event ring_id;        
         let latency = Int64.to_int (Int64.sub ts saved_ts) in
-        Printf.printf "recording E %d\n" latency;
-        assert (H.record_value hist latency)
+        (* Note trace timestamps are in us but print_percentiles expects nanoseconds; so
+           we need to scale latency to ns *)
+        assert (H.record_value hist (1000 * latency))
     | _ -> ()
   in
   seq |> Seq.iter (fun json -> 
