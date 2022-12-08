@@ -145,6 +145,29 @@ let trace trace_filename exec_args =
   let cleanup () = close_out trace_file in
   olly ~runtime_begin ~runtime_end ~init ~cleanup exec_args
 
+(* ftf ~ fuchsia trace format *)
+let trace_ftf trace_filename exec_args =
+  let open Tracing in
+  let trace_file = Trace.create_for_file ~base_time:None ~filename:trace_filename in
+  (* Note trace timestamps in us, since this is expected by Chrome tracing? *)
+  let ts_to_us ts = Int64.(div (Ts.to_int64 ts) (of_int 1000)) in
+  let int_to_span i = Core.Time_ns.Span.of_int_ns i in
+  let thread = Trace.allocate_thread trace_file ~pid:1 ~name:"Thread 1" in
+  let runtime_begin _ring_id ts phase =
+    (* FIXME thread should be ring_id *)
+    Trace.write_duration_begin trace_file ~args:[] ~thread ~category:"PERF"
+      ~name:(Runtime_events.runtime_phase_name phase)
+      ~time: (ts_to_us ts |> Int64.to_int |> int_to_span)
+  in
+  let runtime_end _ring_id ts phase =
+    Trace.write_duration_end trace_file ~args:[] ~thread ~category:"PERF"
+      ~name:(Runtime_events.runtime_phase_name phase)
+      ~time: (ts_to_us ts |> Int64.to_int |> int_to_span)
+  in
+  let init () = () in
+  let cleanup () = Trace.close trace_file in
+  olly ~runtime_begin ~runtime_end ~init ~cleanup exec_args
+
 let latency json output exec_args =
   let count = ref 0 in
   let current_event = Hashtbl.create 13 in
@@ -171,8 +194,8 @@ let latency json output exec_args =
   let cleanup () = print_percentiles json output hist; Printf.printf "Total count of events: %d\n" !count in
   olly ~runtime_begin ~runtime_end ~init ~cleanup exec_args
 
-(* FIXME move to Runtime_event module; make efficient *) 
-let string_to_runtime_phase = 
+(* FIXME move to Runtime_event module; make efficient *)
+let string_to_runtime_phase =
   let tbl = Hashtbl.create 13 in
   let all_phases = Runtime_events.[
       EV_EXPLICIT_GC_SET
@@ -214,17 +237,17 @@ let string_to_runtime_phase =
     ; EV_MINOR_REMEMBERED_SET_PROMOTE
     ; EV_MINOR_LOCAL_ROOTS_PROMOTE
     ; EV_DOMAIN_CONDITION_WAIT
-    ; EV_DOMAIN_RESIZE_HEAP_RESERVATION] 
+    ; EV_DOMAIN_RESIZE_HEAP_RESERVATION]
     (* NOTE the above should be all the variants for the type *)
   in
   all_phases |> List.iter (fun ph -> Hashtbl.replace tbl (Runtime_events.runtime_phase_name ph) ph);
   fun s -> Hashtbl.find tbl s
 
-let trace_to_latency (json:bool) (output:string option) trace_filename = 
+let trace_to_latency (json:bool) (output:string option) trace_filename =
   let trace_file = open_in trace_filename in
   (* quick and dirty - we really need a stream of events *)
-  let seq = 
-    trace_file |> Yojson.Safe.from_channel |> function 
+  let seq =
+    trace_file |> Yojson.Safe.from_channel |> function
     | `List xs -> List.to_seq xs
     | _ -> failwith ""
   in
@@ -243,20 +266,20 @@ let trace_to_latency (json:bool) (output:string option) trace_filename =
   let runtime_end ring_id ts (phase:Runtime_events.runtime_phase) =
     match Hashtbl.find_opt current_event ring_id with
     | Some (saved_phase, saved_ts) when saved_phase = phase ->
-        Hashtbl.remove current_event ring_id;        
+        Hashtbl.remove current_event ring_id;
         let latency = Int64.to_int (Int64.sub ts saved_ts) in
         (* Note trace timestamps are in us but print_percentiles expects nanoseconds; so
            we need to scale latency to ns *)
         assert (H.record_value hist (1000 * latency))
     | _ -> ()
   in
-  seq |> Seq.iter (fun json -> 
+  seq |> Seq.iter (fun json ->
       let evt = event_of_yojson json in
       match evt.ph with
       | "B" -> runtime_begin evt.pid evt.ts (string_to_runtime_phase evt.name)
       | "E" -> runtime_end evt.pid evt.ts (string_to_runtime_phase evt.name)
       | _ -> failwith "unknown phase");
-  print_percentiles json output hist  
+  print_percentiles json output hist
 
 let run_test () =
   let hist =
@@ -264,7 +287,7 @@ let run_test () =
       ~significant_figures:3
   in
   [77;3;824;22] |> List.iter (fun lat -> assert(H.record_value hist (lat * 1000)));
-  print_percentiles false None hist  
+  print_percentiles false None hist
 
 let help man_format cmds topic =
   match topic with
@@ -328,9 +351,26 @@ let () =
     Cmd.v info Term.(const trace $ trace_filename $ exec_args 1)
   in
 
+  let trace_ftf_cmd =
+    let trace_filename =
+      let doc = "Target trace file name." in
+      Arg.(required & pos 0 (some string) None & info [] ~docv:"TRACEFILE" ~doc)
+    in
+    let man =
+      [
+        `S Manpage.s_description;
+        `P "Save the runtime trace in Fuchsia Trace Format (FTF).";
+        `Blocks help_secs;
+      ]
+    in
+    let doc = "Save the runtime trace in Fuchsia Trace Format (FTF)." in
+    let info = Cmd.info "trace_ftf" ~doc ~sdocs ~man in
+    Cmd.v info Term.(const trace_ftf $ trace_filename $ exec_args 1)
+  in
+
   let json_option =
     let doc = "Print the output in json instead of human-readable format." in
-    Arg.(value & flag & info [ "json" ] ~docv:"json" (* FIXME needed? *) ~doc) 
+    Arg.(value & flag & info [ "json" ] ~docv:"json" (* FIXME needed? *) ~doc)
   in
 
   let output_option =
@@ -357,12 +397,12 @@ let () =
     Cmd.v info Term.(const latency $ json_option $ output_option $ exec_args 0)
   in
 
-  let trace_file_arg = 
+  let trace_file_arg =
     let doc = "The trace file in json format." in
     Arg.(required & pos 0 (some string) None & info [] ~docv:"TRACE_FILE" ~doc)
   in
 
-  let trace_to_latency_cmd = 
+  let trace_to_latency_cmd =
     let doc = "Read trace and report the GC latency profile." in
     let man =
       [
@@ -373,13 +413,13 @@ let () =
     in
     let info = Cmd.info "trace_to_latency" ~doc ~sdocs ~man in
     Cmd.v info Term.(const trace_to_latency $ json_option $ output_option $ trace_file_arg)
-  in    
+  in
 
-  let run_test_cmd = 
+  let run_test_cmd =
     let info = Cmd.info "run_test" in
     Cmd.v info Term.(const run_test $ const ())
   in
-    
+
 
   let help_cmd =
     let topic =
@@ -402,7 +442,7 @@ let () =
   let main_cmd =
     let doc = "An observability tool for OCaml programs" in
     let info = Cmd.info "olly" ~doc ~sdocs in
-    Cmd.group info [ trace_cmd; latency_cmd; trace_to_latency_cmd; run_test_cmd; help_cmd ]
+    Cmd.group info [ trace_cmd; trace_ftf_cmd; latency_cmd; trace_to_latency_cmd; run_test_cmd; help_cmd ]
   in
 
   exit (Cmd.eval main_cmd)

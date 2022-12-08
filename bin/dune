@@ -3,4 +3,4 @@
  (name olly)
  (modules olly)
  (preprocess (pps ppx_yojson_conv))
- (libraries runtime_events unix hdr_histogram cmdliner yojson))
+ (libraries runtime_events unix hdr_histogram cmdliner yojson tracing))
