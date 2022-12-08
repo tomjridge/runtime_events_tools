@@ -152,14 +152,19 @@ let trace_ftf trace_filename exec_args =
   (* Note trace timestamps in us, since this is expected by Chrome tracing? *)
   let ts_to_us ts = Int64.(div (Ts.to_int64 ts) (of_int 1000)) in
   let int_to_span i = Core.Time_ns.Span.of_int_ns i in
-  let thread = Trace.allocate_thread trace_file ~pid:1 ~name:"Thread 1" in
-  let runtime_begin _ring_id ts phase =
-    (* FIXME thread should be ring_id *)
+  let doms = 
+    (* allocate all domains before starting to write trace *)
+    let max_doms = 128 in
+    Array.init max_doms (fun i -> Trace.allocate_thread trace_file ~pid:1 ~name:(Printf.sprintf "Thread %d" i))
+  in
+  let runtime_begin ring_id ts phase =
+    let thread = doms.(ring_id) in
     Trace.write_duration_begin trace_file ~args:[] ~thread ~category:"PERF"
       ~name:(Runtime_events.runtime_phase_name phase)
       ~time: (ts_to_us ts |> Int64.to_int |> int_to_span)
   in
-  let runtime_end _ring_id ts phase =
+  let runtime_end ring_id ts phase =
+    let thread = doms.(ring_id) in
     Trace.write_duration_end trace_file ~args:[] ~thread ~category:"PERF"
       ~name:(Runtime_events.runtime_phase_name phase)
       ~time: (ts_to_us ts |> Int64.to_int |> int_to_span)
