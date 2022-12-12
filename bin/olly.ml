@@ -57,7 +57,7 @@ let print_percentiles json output hist =
 let lost_events ring_id num =
   Printf.eprintf "[ring_id=%d] Lost %d events\n%!" ring_id num
 
-let olly ~runtime_begin ~runtime_end ~cleanup ~init exec_args =
+let olly ~preserve ~runtime_begin ~runtime_end ~cleanup ~init exec_args =
   let argsl = String.split_on_char ' ' exec_args in
   let executable_filename = List.hd argsl in
 
@@ -92,7 +92,7 @@ let olly ~runtime_begin ~runtime_end ~cleanup ~init exec_args =
   in
   while child_alive () do
     Runtime_events.read_poll cursor callbacks None |> ignore;
-    Unix.sleepf 0.1 (* Poll at 10Hz *)
+    (* Unix.sleepf 0.000001 *)
   done;
 
   (* Do one more poll in case there are any remaining events we've missed *)
@@ -103,10 +103,17 @@ let olly ~runtime_begin ~runtime_end ~cleanup ~init exec_args =
   let ring_file =
     Filename.concat tmp_dir (string_of_int child_pid ^ ".events")
   in
-  Unix.unlink ring_file;
+  (if preserve then () else Unix.unlink ring_file);
   cleanup ()
 
-let trace trace_filename exec_args =
+let noop preserve exec_args = 
+  let runtime_begin _ring_id _ts _phase = () in
+  let runtime_end _ring_id _ts _phase = () in
+  let init () = () in
+  let cleanup () = () in
+  olly ~preserve ~runtime_begin ~runtime_end ~init ~cleanup exec_args
+
+let trace preserve trace_filename exec_args =
   let trace_file = open_out trace_filename in
   let ts_to_us ts = Int64.(div (Ts.to_int64 ts) (of_int 1000)) in
   let runtime_begin ring_id ts phase =
@@ -130,10 +137,10 @@ let trace trace_filename exec_args =
     Printf.fprintf trace_file "["
   in
   let cleanup () = close_out trace_file in
-  olly ~runtime_begin ~runtime_end ~init ~cleanup exec_args
+  olly ~preserve ~runtime_begin ~runtime_end ~init ~cleanup exec_args
 
 (* ftf ~ fuchsia trace format, a binary format viewable in Perfetto *)
-let trace_ftf trace_filename exec_args =
+let trace_ftf preserve trace_filename exec_args =
   let open Tracing in
   let trace_file = Trace.create_for_file ~base_time:None ~filename:trace_filename in
   (* Note: FTF timestamps are nanoseconds
@@ -147,7 +154,7 @@ let trace_ftf trace_filename exec_args =
        consumes about 7kB in the trace file. *)
     let max_doms = 128 in
     Array.init max_doms (fun i -> 
-        Trace.allocate_thread trace_file ~pid:1 ~name:(Printf.sprintf "Ring_id %d" i))
+        Trace.allocate_thread trace_file ~pid:i ~name:(Printf.sprintf "dom %d" i))
   in
   let runtime_begin ring_id ts phase =
     let thread = doms.(ring_id) in
@@ -163,7 +170,7 @@ let trace_ftf trace_filename exec_args =
   in
   let init () = () in
   let cleanup () = Trace.close trace_file in
-  olly ~runtime_begin ~runtime_end ~init ~cleanup exec_args
+  olly ~preserve ~runtime_begin ~runtime_end ~init ~cleanup exec_args
 
 let latency json output exec_args =
   let current_event = Hashtbl.create 13 in
@@ -186,7 +193,7 @@ let latency json output exec_args =
   in
   let init = Fun.id in
   let cleanup () = print_percentiles json output hist in
-  olly ~runtime_begin ~runtime_end ~init ~cleanup exec_args
+  olly ~preserve:false ~runtime_begin ~runtime_end ~init ~cleanup exec_args
 
 let help man_format cmds topic =
   match topic with
@@ -233,6 +240,24 @@ let () =
     Arg.(required & pos p (some string) None & info [] ~docv:"EXECUTABLE" ~doc)
   in
 
+  let preserve_option =
+    let doc = "Preserve the runtime events ring file." in
+    Arg.(value & flag & info [ "preserve" ] ~docv:"preserve" ~doc)
+  in
+
+  let noop_cmd =
+    let man =
+      [
+        `S Manpage.s_description;
+        `P "Execute noop on runtime_begin and runtime_end events.";
+        `Blocks help_secs;
+      ]
+    in
+    let doc = "Execute noop on runtime_begin and runtime_end events." in
+    let info = Cmd.info "noop" ~doc ~sdocs ~man in
+    Cmd.v info Term.(const noop $ preserve_option $ exec_args 0)
+  in
+
   let trace_cmd =
     let trace_filename =
       let doc = "Target trace file name." in
@@ -247,7 +272,7 @@ let () =
     in
     let doc = "Save the runtime trace in Chrome trace format." in
     let info = Cmd.info "trace" ~doc ~sdocs ~man in
-    Cmd.v info Term.(const trace $ trace_filename $ exec_args 1)
+    Cmd.v info Term.(const trace $ preserve_option $ trace_filename $ exec_args 1)
   in
 
   let trace_ftf_cmd =
@@ -264,7 +289,7 @@ let () =
     in
     let doc = "Save the runtime trace in Fuchsia Trace Format (FTF)." in
     let info = Cmd.info "trace_ftf" ~doc ~sdocs ~man in
-    Cmd.v info Term.(const trace_ftf $ trace_filename $ exec_args 1)
+    Cmd.v info Term.(const trace_ftf $ preserve_option $ trace_filename $ exec_args 1)
   in
 
   let json_option =
@@ -317,7 +342,7 @@ let () =
   let main_cmd =
     let doc = "An observability tool for OCaml programs" in
     let info = Cmd.info "olly" ~doc ~sdocs in
-    Cmd.group info [ trace_cmd; trace_ftf_cmd; latency_cmd; help_cmd ]
+    Cmd.group info [ trace_cmd; trace_ftf_cmd; latency_cmd; noop_cmd; help_cmd ]
   in
 
   exit (Cmd.eval main_cmd)
